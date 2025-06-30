@@ -22,7 +22,7 @@
         };
         testScript = ''
           print("${inputs.entropy}")
-          print("${./spec.json}")
+          print("${./Makefile}")
           m1.wait_for_unit("multi-user.target")
           print(m1.succeed("exit ${rc}"))
         '';

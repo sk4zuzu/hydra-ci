@@ -4,32 +4,17 @@
 
 set -eu -o pipefail
 
-: "${ISO_PATH:=/dev/sr0}"
+: "${CONTEXT_PATH:=/dev/sr0}"
 
-source <(isoinfo -i "$ISO_PATH" -R -x /context.sh)
+source <(isoinfo -i "$CONTEXT_PATH" -R -x /context.sh)
 
 : "${HYDRA_HOST:=http://$ETH0_IP:3000}"
 : "${HYDRA_USER:=asd}"
 : "${HYDRA_PASSWORD:=asd}"
 : "${HYDRA_PROJECT_ID:=hydra-ci}"
 : "${HYDRA_FLAKE_URL:=https://github.com/sk4zuzu/hydra-ci.git}"
-
-install -o 122 -g 122 -m u=rwx,go=rx -d /var/tmp/hydra-ci/
-install -o 122 -g 122 -m u=rw,go=r /dev/fd/0 /var/tmp/hydra-ci/flake.nix <<NIX
-{
-  inputs = {
-    entropy = {
-      url = "file+file:///dev/null";
-      flake = false;
-    };
-    hydra-ci = {
-      url = "git+$HYDRA_FLAKE_URL";
-      inputs.entropy.follows = "entropy";
-    };
-  };
-  outputs = { hydra-ci, ... }: { inherit (hydra-ci) packages checks; };
-}
-NIX
+: "${HYDRA_BASE:=/var/tmp/$HYDRA_PROJECT_ID}"
+: "${HYDRA_JOBS:=test1 test2}"
 
 install -o 0 -g 0 -m u=rw,go=r /dev/fd/0 /etc/nixos/configuration.nix.d/01-hostname.nix <<NIX
 { ... }: { networking.hostName = "$SET_HOSTNAME"; }
@@ -90,6 +75,11 @@ install -o 0 -g 0 -m u=rw,go=r /dev/fd/0 /etc/nixos/configuration.nix.d/02-hydra
     buildMachinesFiles = [ "/etc/nix/machines" ];
     useSubstitutes = true;
   };
+}
+NIX
+
+install -o 0 -g 0 -m u=rw,go=r /dev/fd/0 /etc/nixos/configuration.nix.d/03-timers.nix <<NIX
+{ pkgs, ... }: {
   systemd = {
     timers."hydra-ci-touch" = {
       after = [ "hydra-evaluator.service" ];
@@ -104,11 +94,13 @@ install -o 0 -g 0 -m u=rw,go=r /dev/fd/0 /etc/nixos/configuration.nix.d/02-hydra
       serviceConfig = {
         Type = "oneshot";
         User = "122";
-        WorkingDirectory = "/var/tmp/hydra-ci/";
+        WorkingDirectory = "$HYDRA_BASE";
       };
       path = with pkgs; [ coreutils git nix ];
       script = ''
-        nix flake update --override-input entropy file+file://<(date --utc)
+        for JOB in $HYDRA_JOBS; do
+          (cd \$JOB/ && nix flake update --override-input entropy file+file://<(date --utc))
+        done
       '';
     };
   };
@@ -132,6 +124,44 @@ while ! curl -fsSL -H 'Accept: application/json' "$HYDRA_HOST/"; do
     sleep 5
 done
 
+for JOB in $HYDRA_JOBS; do install -o 122 -g 122 -m u=rwx,go=rx -d "$HYDRA_BASE/"{,"$JOB/"}; done
+for JOB in $HYDRA_JOBS; do install -o 122 -g 122 -m u=rw,go=r /dev/fd/0 "/var/tmp/hydra-ci/$JOB/flake.nix" <<NIX
+{
+  inputs = {
+    entropy = {
+      url = "file+file:///dev/null";
+      flake = false;
+    };
+    hydra-ci = {
+      url = "git+$HYDRA_FLAKE_URL";
+      inputs.entropy.follows = "entropy";
+    };
+  };
+  outputs = { hydra-ci, ... }: {
+    checks.x86_64-linux.hydra-ci-$JOB = hydra-ci.checks.x86_64-linux.hydra-ci-$JOB;
+  };
+}
+NIX
+done
+
+for JOB in $HYDRA_JOBS; do cat <<JSON
+{
+  "hydra-ci-$JOB": {
+    "enabled": 1,
+    "hidden": false,
+    "description": "hydra-ci-$JOB",
+    "flake": "path:$HYDRA_BASE/$JOB",
+    "checkinterval": 30,
+    "schedulingshares": 100,
+    "enableemail": false,
+    "emailoverride": "",
+    "keepnr": 1,
+    "type": 1
+  }
+}
+JSON
+done | jq -rs add | install -o 122 -g 122 -m u=rw,go=r /dev/fd/0 "$HYDRA_BASE/spec.json"
+
 read -r -d "#\n" LOGIN_JSON <<JSON
 {
   "username": "$HYDRA_USER",
@@ -145,9 +175,9 @@ read -r -d "#\n" PROJECT_JSON <<JSON
   "enabled": true,
   "hidden": false,
   "declarative": {
-    "type": "git",
+    "type": "path",
     "file": "spec.json",
-    "value": "$HYDRA_FLAKE_URL"
+    "value": "$HYDRA_BASE"
   }
 }#
 JSON
